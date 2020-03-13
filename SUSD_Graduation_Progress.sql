@@ -158,6 +158,57 @@ where upper(gp.subject) = 'MATHEMATICS';
 
 #ENDOFCHANGES#
 
+#GENERAL SCI HANDLING#
+#data for potential general science overflow
+drop table if exists gen_sci_sems;
+create table gen_sci_sems as
+select studentID,
+	semsComplete,
+    semsInProgress,
+    semsReqdTotal,
+    greatest(0,semsInProgress+semsComplete-semsReqdTotal) as subjectOverflow,
+    subject
+    from grad_progress
+    where UPPER(`subject`) in ('Biological Science','Physical Science') and studentID in (select studentID from grad_progress where subject = 'General Science');
+    
+
+drop table if exists gen_sci_inprogress_overflow;
+create table gen_sci_inprogress_overflow as
+select studentid,
+	subject,
+	least(semsInProgress,subjectOverflow) as inpOverflow
+    from gen_sci_sems;
+    
+update gen_sci_sems gsc
+	inner join gen_sci_inprogress_overflow gsio
+    on gsc.studentid=gsio.studentid and gsc.subject=gsio.subject
+    set gsc.subjectOverflow = gsc.subjectOverflow-gsio.inpOverflow,
+     gsc.semsInProgress = gsc.semsInProgress-gsio.inpOverflow;
+    
+update grad_progress gp
+	inner join gen_sci_inprogress_overflow gsio
+    on gp.studentID=gsio.studentID
+		and gp.subject = 'General Science'
+    set gp.semsInProgress = gp.semsInProgress+gsio.inpOverflow;
+    
+#now add rest of overflow from gen_sci_sems semsComplete of general science
+update grad_progress gp
+	inner join gen_sci_sems gsc
+    on gp.studentID=gsc.studentID
+		and gp.subject = 'General Science'
+	set gp.semsComplete = gp.semsComplete+gsc.subjectOverflow;
+    
+update gen_sci_sems gsc
+	set semsComplete = semsComplete-subjectOverflow;
+    
+update grad_progress gp
+	inner join gen_sci_sems gsc
+	on gp.studentID=gsc.studentID and
+		gp.subject = gsc.subject
+	set gp.semsComplete = gsc.semsComplete,
+		gp.semsInProgress = gsc.semsInProgress;
+#END OF GEN SCI HANDLING
+
 # Create table to hold total sems taken
 DROP TABLE IF EXISTS grad_total_sems;
 CREATE TABLE grad_total_sems
@@ -250,9 +301,9 @@ CREATE TABLE grad_total_overflow
 DROP TABLE IF EXISTS dual_courses;
 CREATE TABLE dual_courses AS 
 (
-SELECT studentID, subject,  SUBSTRING(subject, 1, INSTR(subject, '|')-1) AS primarySubj, SUBSTRING(subject, INSTR(subject, '|')+1, LENGTH(subject)) AS secondarySubj, 
+SELECT id,studentID, subject,  SUBSTRING(subject, 1, INSTR(subject, '|')-1) AS primarySubj, SUBSTRING(subject, INSTR(subject, '|')+1, LENGTH(subject)) AS secondarySubj, #added id to give table a primary key
 	   FLOOR(SUM(CASE WHEN mark > 0 THEN earnedCredits ELSE 0 END)/5) AS semsComplete, FLOOR(SUM(CASE WHEN mark IS null THEN attemptedCredits ELSE 0 END)/5) AS semsInProgress,
-       0 AS primaryComplete, 0 AS primaryInProgress, 0 AS secondaryComplete, 0 AS secondaryInProgress, 0 AS overflowComplete, 0 AS overflowInProgress
+       0 AS primaryComplete, 0 AS primaryInProgress, 0 AS secondaryComplete, 0 AS secondaryInProgress, 0 AS overflowComplete, 0 AS overflowInProgress, 0 AS semsCompleteGS, 0 AS semsInProgressGS #num 1 of implementation
 FROM Transcript
 WHERE subject LIKE '%|%'
 GROUP BY studentID, subject
@@ -275,46 +326,124 @@ SET
 						   END
 WHERE gp.semsReqdTotal > (gp.semsComplete + gp.semsInProgress);
 
-#Count how many credits are used for the secondary subject
-
-UPDATE dual_courses dc
+# num2 of implementation 
+UPDATE dual_courses dc  
 INNER JOIN grad_progress gp
-	ON  dc.studentID = gp.studentID AND dc.secondarySubj = gp.subject
+	ON  dc.studentID = gp.studentID AND dc.primarySubj = gp.subject
 SET
-	dc.secondaryComplete = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)) >= gp.semsReqdTotal
+	dc.semsCompleteGS  = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)) >= gp.semsReqdTotal
 								THEN gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress) -- (dc.semsComplete - dc.primaryComplete) - (gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress))
                                 ELSE dc.semsComplete - dc.primaryComplete
 						   END,
-	dc.secondaryInProgress = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)) >= gp.semsReqdTotal
+	dc.semsInProgressGS  = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)) >= gp.semsReqdTotal
 								  THEN 0
-                                  WHEN (gp.semsComplete + gp.semsInPRogress + (dc.semsComplete - dc.primaryComplete) + (dc.semsInProgress - dc.primaryInProgress)) >= gp.semsReqdTotal
+                                  WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete) + (dc.semsInProgress - dc.primaryInProgress)) >= gp.semsReqdTotal
                                   THEN gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress) -- (dc.semsInProgress - dc.primaryInProgress) - (gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)))
                                   ELSE dc.semsInProgress - dc.primaryInProgress
 							 END
-WHERE gp.semsReqdTotal > (gp.semsComplete + gp.semsInProgress);
+WHERE gp.semsReqdTotal > (gp.semsComplete + gp.semsInProgress) and upper(dc.primarySubj) in ('BIOLOGICAL SCIENCE', 'PHYSICAL SCIENCE') and studentID in (select studentID in grad_progress where subject = 'General Science');
 
+#Count how many credits are used for the secondary subject  | originally line 278
 
-# The rest in dual_courses are overflow
-UPDATE dual_courses
+UPDATE dual_courses dc  #query at 280
+INNER JOIN grad_progress gp
+	ON  dc.studentID = gp.studentID AND dc.secondarySubj = gp.subject
 SET
-overflowComplete = semsComplete - (primaryComplete + secondaryComplete),
-overflowInProgress = semsInProgress - (primaryInProgress + secondaryInProgress);
+	dc.secondaryComplete = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete - dc.semsCompleteGS)) >= gp.semsReqdTotal
+								THEN gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress) -- (dc.semsComplete - dc.primaryComplete) - (gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress))
+                                ELSE dc.semsComplete - dc.primaryComplete - dc.semsCompleteGS
+						   END,
+	dc.secondaryInProgress = CASE WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete - dc.semsCompleteGS)) >= gp.semsReqdTotal
+								  THEN 0
+                                  WHEN (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete - dc.semsCompleteGSaa) + (dc.semsInProgress - dc.primaryInProgress - dc.semsInProgressGS)) >= gp.semsReqdTotal
+                                  THEN gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress) -- (dc.semsInProgress - dc.primaryInProgress) - (gp.semsReqdTotal - (gp.semsComplete + gp.semsInProgress + (dc.semsComplete - dc.primaryComplete)))
+                                  ELSE dc.semsInProgress - dc.primaryInProgress - dc.semsInProgressGS
+							 END
+WHERE gp.semsReqdTotal > (gp.semsComplete + gp.semsInProgress) and upper(dc.primarySubj) not in ('BIOLOGICAL SCIENCE', 'PHYSICAL SCIENCE'); #NUM3
 
-#Update primarySubj from dual_courses in grad_progress
+#NUM4
+#Holds a copy of semsComplete, semsInProgress, and keeps track of the overflow for rows that have Biological/Physical Science as the second subject
+drop table if exists gen_sci_sems2;
+create table gen_sci_sems2 as
+select dc.id,
+  dc.studentID,
+	dc.semsComplete,
+  dc.semsInProgress,
+  gp.semsReqdTotal, #semsReqdTotal of the primarySubj
+  greatest(0,dc.semsInProgress+dc.semsComplete-gp.semsReqdTotal) as subjectOverflow,
+  secondarySubj
+    from dual_courses dc
+    INNER JOIN grad_progress gp on dc.studentID=gp.studentID and 
+      dc.primarySubj=gp.subject   #joining with grad_progress to get the semsReqdTotal of the primarySubj, so we can know how many sems to move to GS sems
+    where UPPER(`secondarySubj`) in ('Biological Science','Physical Science') and studentID in (select studentID from grad_progress where subject = 'General Science');
+
+drop table if exists gen_sci_inprogress_overflow2;  #calculates the amount of overflow that belongs to inProgress
+create table gen_sci_inprogress_overflow2 as
+select id,
+  studentid,
+	secondarySubj,
+	least(semsInProgress,subjectOverflow) as inpOverflow
+    from gen_sci_sems2;
+
+update gen_sci_sems2 gsc  #update gen_sci_sems2 by subtracting the calculated inProgress overflow from subjectOverflow and semsInProgress. The remaining overflow from subjectOverflow will be subtracted from semsComplete
+	inner join gen_sci_inprogress_overflow2 gsio
+    on gsc.studentid=gsio.studentid 
+    and gsc.secondarySubj=gsio.secondarySubj 
+    and gsc.id = gsio.id
+    set gsc.subjectOverflow = gsc.subjectOverflow-gsio.inpOverflow,
+     gsc.semsInProgress = gsc.semsInProgress-gsio.inpOverflow;
+
+update dual_courses dc  #add the calculated inProgress overflow to semsInProgressGS 
+	inner join gen_sci_inprogress_overflow2 gsio
+    on dc.studentID=gsio.studentID
+    and dc.id = gsio.id 
+    set dc.semsInProgressGS = gp.semsInProgressGS+gsio.inpOverflow;
+
+update dual_courses dc  #add the calculated complete overflow to semsCompleteGS
+	inner join gen_sci_sems2 gsc
+    on dc.id=gsc.id
+	set dc.semsCompleteGS = dc.semsComplete+gsc.subjectOverflow;
+
+update gen_sci_sems2 gsc  #update gen_sci_sems2 by subtracking the complete overflow from semsComplete
+	set semsComplete = semsComplete-subjectOverflow;
+
+update dual_courses dc  #copy the updated semsComplete and semsInProgress from gen_sci_sems2 back into dual_courses
+	inner join gen_sci_sems2 gsc
+	on dc.id = gsc.id
+	set dc.semsComplete = gsc.semsComplete,
+		dc.semsInProgress = gsc.semsInProgress;
+#ENDOFNUM4
+
+# The rest in dual_courses are overflow | originally line 298
+UPDATE dual_courses 
+SET
+overflowComplete = semsComplete - (primaryComplete + secondaryComplete + semsCompleteGS),
+overflowInProgress = semsInProgress - (primaryInProgress + secondaryInProgress + semsInProgressGS);
+
+#Update primarySubj from dual_courses in grad_progress  |originally 304
 UPDATE grad_progress gp
-INNER JOIN dual_courses dc
-	ON gp.studentID = dc.studentID AND gp.subject = dc.primarySubj
+INNER JOIN (select studentID,primarySubj,sum(primaryComplete) as primaryCompleteSum, sum(primaryInProgress) as primaryInProgressSum from dual_courses group by studentID,primarySubj) dcs  #num 5
+	ON gp.studentID = dcs.studentID AND gp.subject = dcs.primarySubj
 SET
-	gp.semsComplete = gp.semsComplete + dc.primaryComplete,
-    gp.semsInProgress = gp.semsInProgress + dc.primaryInProgress;
+	gp.semsComplete = gp.semsComplete + dcs.primaryCompleteSum,
+    gp.semsInProgress = gp.semsInProgress + dc.primaryInProgressSum;
     
-#Update secondarySubj from dual_courses in grad_progress
+#Update secondarySubj from dual_courses in grad_progress  | originally 312
 UPDATE grad_progress gp
-INNER JOIN dual_courses dc
-	ON gp.studentID = dc.studentID AND gp.subject = dc.secondarySubj
+INNER JOIN (select studentID,secondarySubj,sum(secondaryComplete) as secondaryCompleteSum, sum(secondaryInProgress) as secondaryInProgressSum from dual_courses group by studentID,secondarySubj) dcs  #num 5
+	ON gp.studentID = dcs.studentID AND gp.subject = dcs.secondarySubj
 SET
-	gp.semsComplete = gp.semsComplete + dc.secondaryComplete,
-    gp.semsInProgress = gp.semsInProgress + dc.secondaryInProgress;
+	gp.semsComplete = gp.semsComplete + dcs.secondaryCompleteSum,
+    gp.semsInProgress = gp.semsInProgress + dc.secondaryInProgressSum; #originally 317
+
+#NUM 6
+UPDATE grad_progress gp
+INNER JOIN (select studentID,secondarySubj,sum(semsCompleteGS) as completeGSSum, sum(semsInProgressGS) as inProgressGSSum from dual_courses group by studentID,secondarySubj) dcs  #num 5
+	ON gp.studentID = dcs.studentID
+SET
+	gp.semsComplete = gp.semsComplete + dcs.completeGSSum,
+    gp.semsInProgress = gp.semsInProgress + dc.inProgressGSSum
+where gp.subject = 'General Science'; #originally 317
     
 #Update electives using dual_courses
 UPDATE grad_progress gp
@@ -325,6 +454,59 @@ INNER JOIN (SELECT studentID, SUM(overflowComplete) AS overflowComplete, SUM(ove
 SET
 	gp.semsComplete = gp.semsComplete + dc.overflowComplete,
     gp.semsInProgress = gp.semsInProgress + dc.overflowInProgress;
+
+
+#NUM7 overflow to electives handling
+DROP TABLE IF EXISTS grad_subj_overflow2;
+CREATE TABLE grad_subj_overflow2
+	AS (SELECT 
+    studentID, `subject`,
+      SUM(CASE
+        WHEN semsComplete - semsReqdTotal < 0 THEN 0
+        ELSE semsComplete - semsReqdTotal
+      END) AS compOverflow,
+      SUM(CASE
+        WHEN
+          (semsInProgress - (CASE
+            WHEN semsReqdTotal - semsComplete < 0 THEN 0
+            ELSE semsReqdTotal - semsComplete
+          END)) < 0
+        THEN
+          0
+        ELSE (semsInProgress - (CASE
+          WHEN semsReqdTotal - semsComplete < 0 THEN 0
+          ELSE semsReqdTotal - semsComplete
+        END))
+      END) AS inpOverflow
+  FROM
+    grad_progress  
+  WHERE
+    `subject` <> 'Electives' AND (semsComplete + semsInProgress) > semsReqdTotal
+  GROUP BY studentID, `subject`);
+
+UPDATE
+  grad_progress gp
+    INNER JOIN
+  (SELECT 
+    studentID, `subject`,
+      SUM(compOverflow) AS compOverflow,
+      SUM(inpOverflow) AS inpOverflow
+  FROM
+    grad_subj_overflow2  
+  GROUP BY studentID) overf ON gp.studentID = overf.studentID
+SET 
+  gp.semsComplete = gp.semsComplete + overf.compOverflow,
+  gp.semsInProgress = gp.semsInProgress + overf.inpOverflow
+WHERE 
+  gp.`subject` = 'Electives';
+
+UPDATE grad_progress gp
+INNER JOIN grad_subj_overflow2 gso
+	ON gp.studentID = gso.studentID AND gp.subject = gso.subject
+SET 
+gp.semsComplete = gp.semsComplete - gso.compOverflow,
+gp.semsInProgress = gp.semsInProgress - gso.inpOverflow;
+#END NUM7
 
         
 # Set the subject on track flag
